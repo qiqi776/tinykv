@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 	"math/rand"
+	"sort"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -208,7 +209,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 		return false
 	}
 	var entries []*pb.Entry
-	    if len(r.RaftLog.entries) > 0 {
+	if len(r.RaftLog.entries) > 0 {
         first := r.RaftLog.entries[0].Index
         for i := r.Prs[to].Next; i <= r.RaftLog.LastIndex(); i++ {
             e := r.RaftLog.entries[i-first]
@@ -426,6 +427,14 @@ func (r *Raft) Step(m pb.Message) error {
 						LogTerm: lastTerm,
 					})
 				}
+    		case pb.MessageType_MsgRequestVote:
+				r.msgs = append(r.msgs, pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					From: r.id,
+					To: m.From,
+					Term: r.Term,
+					Reject: true,
+				})
     		case pb.MessageType_MsgRequestVoteResponse:
 				r.votes[m.From] = !m.Reject
 				granted, rejected := 0, 0
@@ -457,11 +466,85 @@ func (r *Raft) Step(m pb.Message) error {
 						r.sendHeartbeat(id)
 					}
 				}
+			case pb.MessageType_MsgRequestVote:
+				r.msgs = append(r.msgs, pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					From: r.id,
+					To: m.From,
+					Term: r.Term,
+					Reject: true,
+				})
     		case pb.MessageType_MsgHeartbeatResponse:
-				// TODO
+				if r.Prs[m.From].Match < r.RaftLog.LastIndex() {
+        			r.sendAppend(m.From)
+    			}
+			case pb.MessageType_MsgPropose:
+				lastIndex := r.RaftLog.LastIndex()
+				for i, e := range m.Entries {
+					e.Index = lastIndex + uint64(i)+1
+					e.Term = r.Term
+					r.RaftLog.entries = append(r.RaftLog.entries, *e)
+				}
+				r.Prs[r.id].Match = r.RaftLog.LastIndex()
+				r.Prs[r.id].Next = r.RaftLog.LastIndex()+1
+				r.maybeCommit()
+				for id := range r.Prs {
+					if id != r.id {
+						r.sendAppend(id)
+					}
+				}
+			case pb.MessageType_MsgAppendResponse:
+				if m.Reject {
+					if m.Index > 0 {
+						r.Prs[m.From].Next = m.Index
+					} else {
+						r.Prs[m.From].Next = 1
+					}
+					r.sendAppend(m.From)
+				} else {
+					if m.Index > r.Prs[m.From].Match {
+						r.Prs[m.From].Match = m.Index
+						r.Prs[m.From].Next = m.Index+1
+						if r.maybeCommit() {
+							for id := range r.Prs {
+								if id != r.id {
+									r.sendAppend(id)
+								}
+							}
+						}
+					}
+				}
 		}
 	}
 	return nil
+}
+
+func (r *Raft) maybeCommit() bool {
+	matches := make(uint64Slice, 0, len(r.Prs))
+	for _, p := range r.Prs {
+		matches = append(matches, p.Match)
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i] > matches[j]
+	})
+	quorumMatch := matches[len(r.Prs)/2]
+
+	if quorumMatch > r.RaftLog.committed {
+		first := r.RaftLog.FirstIndex()
+		if quorumMatch < first {
+			return false
+		}
+		logTerm, err := r.RaftLog.Term(quorumMatch)
+		if err != nil {
+			return false
+		}
+
+		if logTerm == r.Term {
+			r.RaftLog.committed = quorumMatch
+			return true
+		}
+	}
+	return false
 }
 
 // handleAppendEntries handle AppendEntries RPC request
@@ -513,8 +596,12 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
         }
     }
 
+    lastNewIndex := m.Index
+    if len(m.Entries) > 0 {
+        lastNewIndex = m.Entries[len(m.Entries)-1].Index
+    }
     if m.Commit > r.RaftLog.committed {
-        r.RaftLog.committed = min(m.Commit, r.RaftLog.LastIndex())
+        r.RaftLog.committed = min(m.Commit, lastNewIndex)
     }
 
     r.msgs = append(r.msgs, pb.Message{
