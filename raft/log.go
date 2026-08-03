@@ -20,9 +20,9 @@ import (
 
 // RaftLog manage the log entries, its struct look like:
 //
-//  snapshot/first.....applied....committed....stabled.....last
-//  --------|------------------------------------------------|
-//                            log entries
+//	snapshot/first.....applied....committed....stabled.....last
+//	--------|------------------------------------------------|
+//	                          log entries
 //
 // for simplify the RaftLog implement should manage all log entries
 // that not truncated
@@ -65,7 +65,7 @@ func newLog(storage Storage) *RaftLog {
 	if err != nil {
 		panic(err)
 	}
-	
+
 	var entries []pb.Entry
 	if first <= last {
 		stored, err := storage.Entries(first, last+1)
@@ -77,11 +77,11 @@ func newLog(storage Storage) *RaftLog {
 	}
 
 	return &RaftLog{
-		storage: storage,
-		committed: first-1,
-		applied: first-1,
-		stabled: last,
-		entries: entries,
+		storage:   storage,
+		committed: first - 1,
+		applied:   first - 1,
+		stabled:   last,
+		entries:   entries,
 	}
 }
 
