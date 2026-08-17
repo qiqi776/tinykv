@@ -338,8 +338,85 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// Hint: things need to do here including: update peer storage state like raftState and applyState, etc,
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
-	// Your Code Here (2C).
-	return nil, nil
+	if snapshot == nil || snapshot.Metadata == nil {
+		return nil, errors.New("missing snapshot metadata")
+	}
+
+	newRegion := snapData.GetRegion()
+	if newRegion == nil {
+		return nil, errors.New("missing region in snapshot")
+	}
+	if newRegion.GetId() != ps.region.GetId() {
+		return nil, errors.Errorf("snapshot region %d does not match peer region %d", newRegion.GetId(), ps.region.GetId())
+	}
+
+	prevRegion := ps.region
+	oldStartKey := prevRegion.GetStartKey()
+	oldEndKey := prevRegion.GetEndKey()
+
+	if err := ps.clearMeta(kvWB, raftWB); err != nil {
+		return nil, err
+	}
+
+	ps.clearExtraData(newRegion)
+
+	snapIndex := snapshot.Metadata.Index
+	snapTerm := snapshot.Metadata.Term
+
+	ps.raftState = &rspb.RaftLocalState{
+		HardState: new(eraftpb.HardState),
+		LastIndex: snapIndex,
+		LastTerm:  snapTerm,
+	}
+
+	ps.applyState = &rspb.RaftApplyState{
+		AppliedIndex: snapIndex,
+		TruncatedState: &rspb.RaftTruncatedState{
+			Index: snapIndex,
+			Term:  snapTerm,
+		},
+	}
+
+	if err := kvWB.SetMeta(
+		meta.ApplyStateKey(newRegion.Id),
+		ps.applyState,
+	); err != nil {
+		return nil, err
+	}
+
+	meta.WriteRegionState(kvWB, newRegion, rspb.PeerState_Normal)
+	ps.region = newRegion
+	result := &ApplySnapResult{
+		PrevRegion: prevRegion,
+		Region:     newRegion,
+	}
+
+	notifier := make(chan bool, 1)
+	ps.snapState = snap.SnapState{
+		StateType: snap.SnapState_Applying,
+	}
+	defer func() {
+		ps.snapState = snap.SnapState{
+			StateType: snap.SnapState_Relax,
+		}
+	}()
+
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: newRegion.Id,
+		Notifier: notifier,
+		SnapMeta: snapshot.Metadata,
+		StartKey: oldStartKey,
+		EndKey:   oldEndKey,
+	}
+
+	if applied := <-notifier; !applied {
+		return nil, errors.Errorf(
+			"failed to apply snapshot for region %d",
+			newRegion.Id,
+		)
+	}
+
+	return result, nil
 }
 
 // Save memory states to disk.

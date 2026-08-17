@@ -50,6 +50,35 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 
 	rd := d.RaftGroup.Ready()
+	applyResult, err := d.peerStorage.SaveReadyState(&rd)
+	if err != nil {
+		panic(err)
+	}
+
+	if applyResult != nil {
+		storeMeta := d.ctx.storeMeta
+		storeMeta.Lock()
+
+		prevRegion := applyResult.PrevRegion
+		newRegion := applyResult.Region
+
+		if len(prevRegion.GetPeers()) > 0 {
+			oldItem := &regionItem{
+				region: prevRegion,
+			}
+			if storeMeta.regionRanges.Delete(oldItem) == nil {
+				storeMeta.Unlock()
+				panic(fmt.Sprintf("%s previous region is missing from regionRanges", d.Tag))
+			}
+		}
+
+		storeMeta.setRegion(newRegion, d.peer)
+		storeMeta.regionRanges.ReplaceOrInsert(&regionItem{
+			region: newRegion,
+		})
+		storeMeta.Unlock()
+	}
+
 	if _, err := d.peerStorage.SaveReadyState(&rd); err != nil {
 		panic(err)
 	}
@@ -82,6 +111,24 @@ func (d *peerMsgHandler) applyEntry(entry *eraftpb.Entry, kvWB *engine_util.Writ
 	msg := new(raft_cmdpb.RaftCmdRequest)
 	if err := msg.Unmarshal(entry.Data); err != nil {
 		panic(err)
+	}
+
+	if msg.AdminRequest != nil {
+		switch msg.AdminRequest.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			compact := msg.AdminRequest.CompactLog
+			d.peerStorage.applyState.TruncatedState.Index = compact.CompactIndex
+			d.peerStorage.applyState.TruncatedState.Term = compact.CompactTerm
+			if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+				panic(err)
+			}
+			d.finishProposal(entry, newCmdResp(), false)
+			d.ScheduleCompactLog(compact.CompactIndex)
+			return kvWB
+		default:
+			d.finishProposal(entry, newCmdResp(), false)
+			return kvWB
+		}
 	}
 
 	if len(msg.Requests) == 0 {
@@ -151,7 +198,9 @@ func (d *peerMsgHandler) finishProposal(entry *eraftpb.Entry, resp *raft_cmdpb.R
 	for len(d.proposals) > 0 {
 		p := d.proposals[0]
 		if p.index < entry.Index {
-			NotifyStaleReq(entry.Term, p.cb)
+			if p.cb != nil {
+				NotifyStaleReq(entry.Term, p.cb)
+			}
 			d.proposals = d.proposals[1:]
 			continue
 		}
@@ -159,12 +208,16 @@ func (d *peerMsgHandler) finishProposal(entry *eraftpb.Entry, resp *raft_cmdpb.R
 			return
 		}
 		if p.term != entry.Term {
-			NotifyStaleReq(entry.Term, p.cb)
+			if p.cb != nil {
+				NotifyStaleReq(entry.Term, p.cb)
+			}
 		} else {
 			if needTxn && p.cb != nil {
 				p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
 			}
-			p.cb.Done(resp)
+			if p.cb != nil {
+				p.cb.Done(resp)
+			}
 		}
 		d.proposals = d.proposals[1:]
 		return

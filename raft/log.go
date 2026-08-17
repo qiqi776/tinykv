@@ -89,7 +89,28 @@ func newLog(storage Storage) *RaftLog {
 // storage compact stabled log entries prevent the log entries
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
-	// Your Code Here (2C).
+	firstIndex, err := l.storage.FirstIndex()
+	if err != nil {
+		panic(err)
+	}
+
+	if len(l.entries) == 0 {
+		return
+	}
+
+	memoryFirst := l.entries[0].Index
+	if firstIndex <= memoryFirst {
+		return
+	}
+
+	if firstIndex > l.LastIndex() {
+		l.entries = nil
+		return
+	}
+
+	offset := firstIndex - memoryFirst
+	remain := append([]pb.Entry(nil), l.entries[offset:]...)
+	l.entries = remain
 }
 
 // allEntries return all the entries not compacted.
@@ -132,6 +153,9 @@ func (l *RaftLog) LastIndex() uint64 {
 	if n := len(l.entries); n != 0 {
 		return l.entries[n-1].Index
 	}
+	if !IsEmptySnap(l.pendingSnapshot) {
+		return l.pendingSnapshot.Metadata.Index
+	}
 	i, err := l.storage.LastIndex()
 	if err != nil {
 		panic(err)
@@ -143,6 +167,9 @@ func (l *RaftLog) FirstIndex() uint64 {
 	if len(l.entries) > 0 && l.entries[0].Index > 0 {
 		return l.entries[0].Index
 	}
+	if !IsEmptySnap(l.pendingSnapshot) {
+		return l.pendingSnapshot.Metadata.Index + 1
+	}
 	i, err := l.storage.FirstIndex()
 	if err != nil {
 		panic(err)
@@ -152,6 +179,16 @@ func (l *RaftLog) FirstIndex() uint64 {
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
+	if !IsEmptySnap(l.pendingSnapshot) {
+		snapIndex := l.pendingSnapshot.Metadata.Index
+		switch {
+		case i < snapIndex:
+			return 0, ErrCompacted
+		case i == snapIndex:
+			return l.pendingSnapshot.Metadata.Term, nil
+		}
+	}
+
 	if i > l.LastIndex() {
 		return 0, ErrUnavailable
 	}
